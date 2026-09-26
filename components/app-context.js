@@ -275,8 +275,9 @@ export function AppProvider({ children }) {
     setAuthOpen(true)
   }
 
-  const auth = async (mode, email, password) => {
-    const r = await api(`/api/auth/${mode}`, { method: 'POST', body: { email, password } })
+  const auth = async (mode, email, password, gender = 'prefer-not-to-say') => {
+    const payload = mode === 'signup' ? { email, password, gender } : { email, password }
+    const r = await api(`/api/auth/${mode}`, { method: 'POST', body: payload })
     setUser(r.user)
     setAuthOpen(false)
     if (pendingFindRef.current) {

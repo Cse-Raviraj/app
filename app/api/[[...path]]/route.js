@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid'
 import bcrypt from 'bcryptjs'
 import fs from 'fs'
 import path from 'path'
+import nodemailer from 'nodemailer'
 import { getDb, generateUserNumber } from '@/lib/db.cjs'
 import { COOKIE_NAME, signToken, verifyToken, getTokenFromRequest } from '@/lib/auth.cjs'
 import { getSharedState } from '@/lib/realtime-state.cjs'
@@ -31,7 +32,7 @@ function err(message, status = 400, code) {
 
 function publicUser(u) {
   if (!u) return null
-  return { id: u.id, anonymousName: u.anonymousName, userNumber: u.userNumber || null, avatarColor: u.avatarColor || '#7C3AED', avatarUrl: u.avatarUrl || null, bio: u.bio || '' }
+  return { id: u.id, anonymousName: u.anonymousName, userNumber: u.userNumber || null, avatarColor: u.avatarColor || '#7C3AED', avatarUrl: u.avatarUrl || null, bio: u.bio || '', gender: u.gender || null }
 }
 function publicConv(c) {
   return { id: c.id, type: c.type, participants: c.participants, status: c.status, endedBy: c.endedBy || null, createdAt: c.createdAt, updatedAt: c.updatedAt }
@@ -78,6 +79,9 @@ async function handleSignup(request, db) {
   const body = await request.json().catch(() => ({}))
   const email = String(body.email || '').trim().toLowerCase()
   const password = String(body.password || '')
+  const gender = String(body.gender || 'prefer-not-to-say').trim().toLowerCase()
+  const validGender = ['male', 'female', 'non-binary', 'prefer-not-to-say'].includes(gender) ? gender : 'prefer-not-to-say'
+
   if (!/^\S+@\S+\.\S+$/.test(email)) return err('Please enter a valid email address.')
   if (password.length < 6) return err('Password must be at least 6 characters.')
   const existing = await db.collection('users').findOne({ email })
@@ -100,6 +104,7 @@ async function handleSignup(request, db) {
     avatarColor: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
     avatarUrl: null,
     bio: '',
+    gender: validGender,
     availableToChat: true,
     online: false,
     createdAt: new Date(),
@@ -119,6 +124,114 @@ async function handleLogin(request, db) {
   if (!ok) return err('Wrong email or password.', 401)
   const token = signToken({ userId: user.id, email: user.email })
   return setAuthCookie(json({ user: publicUser(user) }), token)
+}
+
+function buildOtpMailer() {
+  const host = process.env.SMTP_HOST || process.env.EMAIL_HOST || 'smtp.gmail.com'
+  const port = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT || 587)
+  const user = process.env.SMTP_USER || process.env.EMAIL_USER
+  const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS
+  if (!host || !user || !pass) return null
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+  })
+}
+
+async function sendOtpEmail(email, otp, mailer) {
+  const from = process.env.SMTP_FROM || process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER
+  await mailer.sendMail({
+    from,
+    to: email,
+    subject: 'Talk to Strangers password reset code',
+    text: `Your verification code is ${otp}. It expires in 10 minutes.`,
+    html: `<p>Your verification code is <strong>${otp}</strong>. It expires in 10 minutes.</p>`,
+  })
+  return true
+}
+
+async function handleRequestResetOtp(request, db) {
+  const body = await request.json().catch(() => ({}))
+  const email = String(body.email || '').trim().toLowerCase()
+  if (!/^\S+@\S+\.\S+$/.test(email)) return err('Please enter a valid email address.')
+
+  const mailer = buildOtpMailer()
+  if (!mailer) return err('Email delivery is not configured. Add SMTP_USER and SMTP_PASS to .env, then restart the app.', 503)
+
+  const user = await db.collection('users').findOne({ email })
+  const otp = String(Math.floor(100000 + Math.random() * 900000))
+
+  if (user) {
+    await sendOtpEmail(email, otp, mailer)
+    await db.collection('users').updateOne(
+      { id: user.id },
+      { $set: { passwordResetOtp: otp, passwordResetOtpExpiresAt: new Date(Date.now() + 10 * 60 * 1000), passwordResetOtpVerified: false } }
+    )
+  }
+
+  return json({ ok: true, message: 'If that account exists, a verification code has been sent to your email.' })
+}
+
+async function handleVerifyResetOtp(request, db) {
+  const body = await request.json().catch(() => ({}))
+  const email = String(body.email || '').trim().toLowerCase()
+  const otp = String(body.otp || '').trim()
+
+  if (!/^\S+@\S+\.\S+$/.test(email)) return err('Please enter a valid email address.')
+  if (!/^\d{6}$/.test(otp)) return err('Please enter the 6-digit OTP code.')
+
+  const user = await db.collection('users').findOne({ email })
+  if (!user || !user.passwordResetOtp || !user.passwordResetOtpExpiresAt) {
+    return err('Invalid or expired OTP.', 400)
+  }
+
+  const expiresAt = new Date(user.passwordResetOtpExpiresAt)
+  if (Date.now() > expiresAt.getTime()) {
+    await db.collection('users').updateOne({ id: user.id }, { $unset: { passwordResetOtp: '', passwordResetOtpExpiresAt: '', passwordResetOtpVerified: '' } })
+    return err('This OTP has expired. Please request a new one.', 400)
+  }
+
+  if (String(user.passwordResetOtp) !== otp) {
+    return err('OTP does not match. Please try again.', 400)
+  }
+
+  await db.collection('users').updateOne({ id: user.id }, { $set: { passwordResetOtpVerified: true } })
+  return json({ ok: true, verified: true, message: 'OTP verified. Please set your new password.' })
+}
+
+async function handleResetPassword(request, db) {
+  const body = await request.json().catch(() => ({}))
+  const email = String(body.email || '').trim().toLowerCase()
+  const otp = String(body.otp || '').trim()
+  const password = String(body.password || '')
+
+  if (!/^\S+@\S+\.\S+$/.test(email)) return err('Please enter a valid email address.')
+  if (!/^\d{6}$/.test(otp)) return err('Please enter the 6-digit OTP code.')
+  if (password.length < 6) return err('Password must be at least 6 characters.')
+
+  const user = await db.collection('users').findOne({ email })
+  if (!user || !user.passwordResetOtp || !user.passwordResetOtpExpiresAt || user.passwordResetOtpVerified !== true) {
+    return err('Please verify the OTP before setting a new password.', 400)
+  }
+
+  const expiresAt = new Date(user.passwordResetOtpExpiresAt)
+  if (Date.now() > expiresAt.getTime() || String(user.passwordResetOtp) !== otp) {
+    await db.collection('users').updateOne({ id: user.id }, { $unset: { passwordResetOtp: '', passwordResetOtpExpiresAt: '', passwordResetOtpVerified: '' } })
+    return err('OTP is invalid or expired. Request a new reset code.', 400)
+  }
+
+  await db.collection('users').updateOne(
+    { id: user.id },
+    {
+      $set: { passwordHash: await bcrypt.hash(password, 10) },
+      $unset: { passwordResetOtp: '', passwordResetOtpExpiresAt: '', passwordResetOtpVerified: '' },
+    }
+  )
+
+  return json({ ok: true, message: 'Password updated successfully. You can now log in.' })
 }
 
 function handleLogout() {
@@ -650,6 +763,10 @@ async function handleRoute(request, { params }) {
     if (route === '/stats' && method === 'GET') return handleStats()
     if (route === '/auth/signup' && method === 'POST') return handleSignup(request, db)
     if (route === '/auth/login' && method === 'POST') return handleLogin(request, db)
+    if (route === '/auth/forgot-password' && method === 'POST') return handleRequestResetOtp(request, db)
+    if (route === '/auth/request-reset-otp' && method === 'POST') return handleRequestResetOtp(request, db)
+    if (route === '/auth/verify-reset-otp' && method === 'POST') return handleVerifyResetOtp(request, db)
+    if (route === '/auth/reset-password' && method === 'POST') return handleResetPassword(request, db)
     if (route === '/auth/logout' && method === 'POST') return handleLogout()
     if (route === '/auth/me' && method === 'GET') return handleMe(request, db)
 
